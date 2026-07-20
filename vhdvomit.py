@@ -268,7 +268,7 @@ def mount_impacket_fuse(host, share, user, password, domain,
         def fsync(self, path, datasync, fh):          return backend.fsync(path, datasync, fh)
 
     def _run():
-        FUSE(_FW(), mnt, foreground=True)
+        FUSE(_FW(), mnt, nothreads=True, foreground=True)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
