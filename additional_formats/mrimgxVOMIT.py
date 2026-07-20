@@ -1318,6 +1318,11 @@ class _ImpacketFUSE:
                     pass
         return 0
 
+    def write(self, path: str, data: bytes, offset: int, fh) -> int:
+        # Silently discard all writes — allows qemu to replay a dirty VHDX log
+        # in its own memory without touching the original file on the share.
+        return len(data)
+
     def teardown(self):
         for conn in (self._list_conn, self._io_conn):
             try:
@@ -1350,9 +1355,10 @@ def mount_impacket_fuse(host: str, share: str, user: str, password: str,
         def open(self, path, flags):               return backend.open(path, flags)
         def read(self, path, size, offset, fh):    return backend.read(path, size, offset, fh)
         def release(self, path, fh):               return backend.release(path, fh)
+        def write(self, path, data, offset, fh):   return backend.write(path, data, offset, fh)
 
     def _run():
-        FUSE(_FW(), mnt, nothreads=True, foreground=True, ro=True)
+        FUSE(_FW(), mnt, nothreads=True, foreground=True)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
