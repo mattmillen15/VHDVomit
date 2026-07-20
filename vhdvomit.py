@@ -81,6 +81,199 @@ def parse_hashes(hashes_str):
     return lmhash, nthash
 
 
+# ---------------------------------------------------------------------------
+# Impacket FUSE filesystem — mounts SMB shares using impacket for auth so
+# NTLM hashes and Kerberos tickets work without touching mount.cifs (which
+# always MD4-hashes whatever password string you give it).
+# ---------------------------------------------------------------------------
+
+class _ImpacketFUSE:
+    """
+    Read-only FUSE backend backed by two impacket SMBConnections:
+      _list_conn  — directory listing  (listPath manages its own TIDs)
+      _io_conn    — file I/O           (openFile/readFile with a held TID)
+    Two connections avoid a TID conflict: listPath disconnects the tree after
+    each call, which would revoke our openFile handles if we shared one conn.
+    """
+
+    def __init__(self, host, share, user, password, domain,
+                 lmhash, nthash, kerberos, aes_key, kdc_host):
+        self.share = share
+        self._list_lock = threading.Lock()
+        self._io_lock   = threading.Lock()
+        self._open_fids = {}   # fuse_path -> smb_fid
+
+        args = (host, user, password, domain, lmhash, nthash, kerberos, aes_key, kdc_host)
+        self._list_conn = self._connect(*args)
+        self._io_conn   = self._connect(*args)
+        self._tid = self._io_conn.connectTree(share)
+
+    @staticmethod
+    def _connect(host, user, password, domain, lmhash, nthash,
+                 kerberos, aes_key, kdc_host):
+        from impacket.smbconnection import SMBConnection
+        conn = SMBConnection(host, host, sess_port=445)
+        if kerberos:
+            conn.kerberosLogin(user, password, domain, lmhash, nthash,
+                               aes_key, kdcHost=kdc_host or host)
+        else:
+            conn.login(user, password, domain, lmhash, nthash)
+        return conn
+
+    def _smb_path(self, fuse_path):
+        p = fuse_path.replace('/', '\\')
+        return p or '\\'
+
+    def getattr(self, path):
+        import errno
+        import fuse
+        import stat as _stat
+
+        st = fuse.Stat()
+        st.st_uid = st.st_gid = 0
+        st.st_atime = st.st_mtime = st.st_ctime = 0
+
+        if path == '/':
+            st.st_mode = _stat.S_IFDIR | 0o755
+            st.st_nlink = 2
+            st.st_size = 0
+            return st
+
+        parent, name = path.rsplit('/', 1)
+        smb_parent = self._smb_path(parent or '/')
+        search = smb_parent.rstrip('\\') + '\\' + name
+
+        with self._list_lock:
+            try:
+                entries = self._list_conn.listPath(self.share, search)
+                for e in entries:
+                    ename = e.get_longname()
+                    if ename in ('.', '..'):
+                        continue
+                    if ename.lower() == name.lower():
+                        if e.is_directory():
+                            st.st_mode = _stat.S_IFDIR | 0o755
+                            st.st_nlink = 2
+                            st.st_size = 0
+                        else:
+                            st.st_mode = _stat.S_IFREG | 0o444
+                            st.st_nlink = 1
+                            st.st_size = e.get_filesize()
+                        return st
+            except Exception:
+                pass
+        return -errno.ENOENT
+
+    def readdir(self, path, offset):
+        import fuse
+        smb_path = self._smb_path(path)
+        search = smb_path.rstrip('\\') + '\\*'
+        yield fuse.Direntry('.')
+        yield fuse.Direntry('..')
+        with self._list_lock:
+            try:
+                entries = self._list_conn.listPath(self.share, search)
+                for e in entries:
+                    name = e.get_longname()
+                    if name not in ('.', '..'):
+                        d = fuse.Direntry(name)
+                        d.type = 4 if e.is_directory() else 8  # DT_DIR / DT_REG
+                        yield d
+            except Exception as ex:
+                tprint(f"  [!] readdir {path}: {ex}")
+
+    def open(self, path, flags):
+        import errno
+        smb_path = self._smb_path(path)
+        with self._io_lock:
+            try:
+                fid = self._io_conn.openFile(
+                    self._tid, smb_path,
+                    desiredAccess=0x80000000,  # GENERIC_READ
+                    shareMode=0x00000007,      # share R/W/D
+                )
+                self._open_fids[path] = fid
+                return 0
+            except Exception as ex:
+                tprint(f"  [!] open {path}: {ex}")
+                return -errno.EIO
+
+    def read(self, path, size, offset):
+        import errno
+        fid = self._open_fids.get(path)
+        if fid is None:
+            return -errno.EBADF
+        with self._io_lock:
+            try:
+                return self._io_conn.readFile(self._tid, fid,
+                                              offset=offset,
+                                              bytesToRead=size,
+                                              singleCall=False)
+            except Exception as ex:
+                tprint(f"  [!] read {path}@{offset}: {ex}")
+                return -errno.EIO
+
+    def release(self, path, flags):
+        with self._io_lock:
+            fid = self._open_fids.pop(path, None)
+            if fid is not None:
+                try:
+                    self._io_conn.closeFile(self._tid, fid)
+                except Exception:
+                    pass
+        return 0
+
+    def teardown(self):
+        for conn in (self._list_conn, self._io_conn):
+            try:
+                conn.logoff()
+            except Exception:
+                pass
+
+
+def mount_impacket_fuse(host, share, user, password, domain,
+                        lmhash, nthash, kerberos, aes_key, kdc_host):
+    """
+    Mount an SMB share as a read-only FUSE filesystem via impacket.
+    Supports NTLM hash and Kerberos auth — bypasses mount.cifs entirely.
+    Returns (mount_path, backend_obj).
+    """
+    try:
+        import fuse
+        fuse.fuse_python_api = (0, 2)
+    except ImportError:
+        die("python3-fuse not found — install: apt install python3-fuse")
+
+    mnt = f"/mnt/smb_{share}"
+    Path(mnt).mkdir(parents=True, exist_ok=True)
+    if is_mounted(mnt):
+        force_umount(mnt)
+
+    backend = _ImpacketFUSE(host, share, user, password, domain,
+                             lmhash, nthash, kerberos, aes_key, kdc_host)
+
+    class _FW(fuse.Fuse):
+        def getattr(self, path):             return backend.getattr(path)
+        def readdir(self, path, offset):     return backend.readdir(path, offset)
+        def open(self, path, flags):         return backend.open(path, flags)
+        def read(self, path, size, offset):  return backend.read(path, size, offset)
+        def release(self, path, flags):      return backend.release(path, flags)
+
+    server = _FW(version="%prog", usage="", dash_s_do='setsingle')
+    server.parse(['-o', 'ro,direct_io,nonempty', mnt], errex=1)
+
+    t = threading.Thread(target=server.main, daemon=True)
+    t.start()
+
+    for _ in range(20):
+        if is_mounted(mnt):
+            print(f"[+] Impacket FUSE mounted {share} at {mnt}")
+            return mnt, backend
+        time.sleep(0.5)
+
+    die(f"Impacket FUSE mount timed out for //{host}/{share}")
+
+
 def list_smb_shares(host, user, password, domain, lmhash='', nthash='',
                     kerberos=False, aes_key='', kdc_host=''):
     try:
@@ -149,7 +342,7 @@ def select_shares(shares):
         print("[!] Invalid selection")
 
 
-def create_cifs_creds(domain, user, password, nthash=''):
+def create_cifs_creds(domain, user, password):
     fd, path = tempfile.mkstemp(prefix="cifs_", suffix=".creds")
     os.close(fd)
 
@@ -158,11 +351,8 @@ def create_cifs_creds(domain, user, password, nthash=''):
             f.write(f"domain={domain}\n")
         if user:
             f.write(f"username={user}\n")
-        # When using pass-the-hash, write the NT hash as the password value.
-        # mount.cifs with sec=ntlmssp treats the provided credential as-is.
-        cred = nthash if (nthash and not password) else password
-        if cred:
-            f.write(f"password={cred}\n")
+        if password:
+            f.write(f"password={password}\n")
 
     os.chmod(path, 0o600)
     return path
@@ -181,7 +371,7 @@ def force_umount(path):
     subprocess.run(['umount', '-l', path], capture_output=True)
 
 
-def mount_cifs_share(host, share, creds_file=None, kerberos=False, nthash=''):
+def mount_cifs_share(host, share, creds_file):
     mnt = Path('/mnt') / share
     mnt.mkdir(parents=True, exist_ok=True)
 
@@ -195,18 +385,8 @@ def mount_cifs_share(host, share, creds_file=None, kerberos=False, nthash=''):
             return None
 
     unc = f"//{host}/{share}"
-
-    if kerberos:
-        # Uses TGT from KRB5CCNAME; no credentials file needed
-        opts = "sec=krb5,vers=3.0,iocharset=utf8"
-        cmd = ['mount', '-t', 'cifs', unc, str(mnt), '-o', opts]
-    elif nthash:
-        # creds_file contains the NT hash as password; sec=ntlmssp for PtH
-        opts = f"credentials={creds_file},sec=ntlmssp,vers=3.0,iocharset=utf8"
-        cmd = ['mount', '-t', 'cifs', unc, str(mnt), '-o', opts]
-    else:
-        opts = f"credentials={creds_file},vers=3.0,iocharset=utf8"
-        cmd = ['mount', '-t', 'cifs', unc, str(mnt), '-o', opts]
+    opts = f"credentials={creds_file},vers=3.0,iocharset=utf8"
+    cmd = ['mount', '-t', 'cifs', unc, str(mnt), '-o', opts]
 
     try:
         subprocess.run(cmd, check=True, capture_output=True)
@@ -615,7 +795,9 @@ def run_smb_mode(args):
 
     lmhash, nthash = parse_hashes(args.hashes)
 
-    if not kerberos and not nthash and user and not password and not getattr(args, 'no_pass', False):
+    # Only prompt for password when using cleartext auth
+    use_fuse = kerberos or bool(nthash)
+    if not use_fuse and user and not password and not getattr(args, 'no_pass', False):
         password = getpass.getpass("[?] Password: ")
 
     domain_prefix = f"{domain}\\" if domain else ""
@@ -654,16 +836,25 @@ def run_smb_mode(args):
     else:
         selected = select_shares(shares)
 
-    creds = None if kerberos else create_cifs_creds(domain, user, password, nthash=nthash)
+    if use_fuse:
+        print("[*] Using impacket FUSE (hash/Kerberos auth — bypasses mount.cifs)")
+    creds = None if use_fuse else create_cifs_creds(domain, user, password)
 
-    mounted_shares = []
+    mounted_shares = []   # all mount points (strings)
+    fuse_mounts = []      # (mnt, backend) pairs for FUSE teardown
 
     try:
         for share in selected:
-            mnt = mount_cifs_share(host, share, creds_file=creds,
-                                   kerberos=kerberos, nthash=nthash)
-            if mnt:
+            if use_fuse:
+                mnt, backend = mount_impacket_fuse(
+                    host, share, user, password, domain,
+                    lmhash, nthash, kerberos, aes_key, kdc_host)
                 mounted_shares.append(mnt)
+                fuse_mounts.append((mnt, backend))
+            else:
+                mnt = mount_cifs_share(host, share, creds)
+                if mnt:
+                    mounted_shares.append(mnt)
 
         if not mounted_shares:
             die("No shares mounted successfully")
@@ -693,8 +884,18 @@ def run_smb_mode(args):
 
     finally:
         print("[*] Cleaning up...")
-        for mnt in mounted_shares:
+        fuse_mnt_set = {m for m, _ in fuse_mounts}
+
+        for mnt, backend in fuse_mounts:
+            subprocess.run(['fusermount', '-u', mnt], capture_output=True)
+            time.sleep(0.3)
             if is_mounted(mnt):
+                force_umount(mnt)
+            backend.teardown()
+            print(f"[+] Unmounted {mnt}")
+
+        for mnt in mounted_shares:
+            if mnt not in fuse_mnt_set and is_mounted(mnt):
                 force_umount(mnt)
                 print(f"[+] Unmounted {mnt}")
 
