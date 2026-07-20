@@ -223,6 +223,12 @@ class _ImpacketFUSE:
         # in its own memory without touching the original file on the share.
         return len(data)
 
+    def flush(self, path, fh):
+        return 0
+
+    def fsync(self, path, datasync, fh):
+        return 0
+
     def teardown(self):
         for conn in (self._list_conn, self._io_conn):
             try:
@@ -252,15 +258,17 @@ def mount_impacket_fuse(host, share, user, password, domain,
                              lmhash, nthash, kerberos, aes_key, kdc_host)
 
     class _FW(Operations):
-        def getattr(self, path, fh=None):          return backend.getattr(path, fh)
-        def readdir(self, path, fh):               return backend.readdir(path, fh)
-        def open(self, path, flags):               return backend.open(path, flags)
-        def read(self, path, size, offset, fh):    return backend.read(path, size, offset, fh)
-        def release(self, path, fh):               return backend.release(path, fh)
-        def write(self, path, data, offset, fh):   return backend.write(path, data, offset, fh)
+        def getattr(self, path, fh=None):             return backend.getattr(path, fh)
+        def readdir(self, path, fh):                  return backend.readdir(path, fh)
+        def open(self, path, flags):                  return backend.open(path, flags)
+        def read(self, path, size, offset, fh):       return backend.read(path, size, offset, fh)
+        def release(self, path, fh):                  return backend.release(path, fh)
+        def write(self, path, data, offset, fh):      return backend.write(path, data, offset, fh)
+        def flush(self, path, fh):                    return backend.flush(path, fh)
+        def fsync(self, path, datasync, fh):          return backend.fsync(path, datasync, fh)
 
     def _run():
-        FUSE(_FW(), mnt, nothreads=True, foreground=True)
+        FUSE(_FW(), mnt, foreground=True)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
