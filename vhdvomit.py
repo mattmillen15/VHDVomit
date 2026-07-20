@@ -493,7 +493,9 @@ def select_vhdx(vhdx_list):
     print("  [n] None")
 
     while True:
-        choice = input("\n[?] Select files (1,2,3 or 'a'/'n'): ").lower()
+        choice = input("\n[?] Select files (1,2,3 or 'a'/'n'): ").strip().lower()
+        if not choice:
+            continue
         if choice in ('n', 'none'):
             return []
         if choice in ('a', 'all'):
@@ -504,7 +506,7 @@ def select_vhdx(vhdx_list):
             selected = [vhdx_list[i-1] for i in indices if 1 <= i <= len(vhdx_list)]
             if selected:
                 return selected
-        except:
+        except Exception:
             pass
 
         print("[!] Invalid selection")
@@ -561,9 +563,17 @@ def mount_vhdx_image(vhdx_path):
         )
         if r.returncode != 0:
             err = r.stderr.decode(errors='replace').strip()
-            print(f"[!] qemu-nbd failed: {err or '(no output)'}")
-            subprocess.run(['qemu-nbd', '--disconnect', nbd_dev], capture_output=True)
-            return None, []
+            if 'log that needs to be replayed' in err:
+                print(f"[*] VHDX has dirty log — retrying with --snapshot (temp writable overlay)")
+                r = subprocess.run(
+                    ['qemu-nbd', '--connect', nbd_dev, f'--format={fmt}', '--snapshot', vhdx_path],
+                    capture_output=True
+                )
+            if r.returncode != 0:
+                err = r.stderr.decode(errors='replace').strip()
+                print(f"[!] qemu-nbd failed: {err or '(no output)'}")
+                subprocess.run(['qemu-nbd', '--disconnect', nbd_dev], capture_output=True)
+                return None, []
         print(f"[+] Connected {nbd_dev}")
 
         time.sleep(3)
