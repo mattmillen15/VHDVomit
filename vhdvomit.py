@@ -555,7 +555,7 @@ def find_free_nbd():
     return None
 
 
-def mount_vhdx_image(vhdx_path):
+def mount_vhdx_image(vhdx_path, fuse_mode=False):
     vhdx_name = Path(vhdx_path).stem
     ext = Path(vhdx_path).suffix.lower()
 
@@ -578,11 +578,20 @@ def mount_vhdx_image(vhdx_path):
         if r.returncode != 0:
             err = r.stderr.decode(errors='replace').strip()
             if 'log that needs to be replayed' in err:
-                print(f"[*] VHDX has dirty log — retrying without --read-only (writes discarded by FUSE)")
-                r = subprocess.run(
-                    ['qemu-nbd', '--connect', nbd_dev, f'--format={fmt}', vhdx_path],
-                    capture_output=True
-                )
+                if fuse_mode:
+                    # FUSE discards all writes, so qemu can replay the log safely
+                    print(f"[*] VHDX has dirty log — retrying without --read-only (writes discarded by FUSE)")
+                    subprocess.run(['qemu-nbd', '--disconnect', nbd_dev], capture_output=True)
+                    time.sleep(0.5)
+                    r = subprocess.run(
+                        ['qemu-nbd', '--connect', nbd_dev, f'--format={fmt}', vhdx_path],
+                        capture_output=True
+                    )
+                else:
+                    print(f"[!] VHDX has a dirty log — cannot mount read-only via mount.cifs.")
+                    print(f"    Try: qemu-img check -r all '{vhdx_path}'  (on a local/writable copy)")
+                    subprocess.run(['qemu-nbd', '--disconnect', nbd_dev], capture_output=True)
+                    return None, []
             if r.returncode != 0:
                 err = r.stderr.decode(errors='replace').strip()
                 print(f"[!] qemu-nbd failed: {err or '(no output)'}")
@@ -747,10 +756,10 @@ def _dump_sam(hostname, sam, system, security):
         run_secretsdump(args, f"{hostname}_secretsdump.txt")
 
 
-def extract_credentials(vhdx_path):
+def extract_credentials(vhdx_path, fuse_mode=False):
     hostname = Path(vhdx_path).stem
 
-    nbd_dev, mounts = mount_vhdx_image(vhdx_path)
+    nbd_dev, mounts = mount_vhdx_image(vhdx_path, fuse_mode=fuse_mode)
     if not nbd_dev:
         return
 
@@ -896,7 +905,7 @@ def run_smb_mode(args):
         selected_vhdx = select_vhdx(vhdx_files)
 
         for vhdx in selected_vhdx:
-            extract_credentials(vhdx)
+            extract_credentials(vhdx, fuse_mode=use_fuse)
 
         print("\n[+] Complete")
 
