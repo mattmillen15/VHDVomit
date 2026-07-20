@@ -1193,7 +1193,7 @@ def parse_hashes(hashes_str: str):
 # ---------------------------------------------------------------------------
 
 class _ImpacketFUSE:
-    """Read-only FUSE backend backed by two impacket SMBConnections."""
+    """Read-only FUSE backend (fusepy API) backed by two impacket SMBConnections."""
 
     def __init__(self, host: str, share: str, user: str, password: str,
                  domain: str, lmhash: str, nthash: str, kerberos: bool,
@@ -1201,7 +1201,8 @@ class _ImpacketFUSE:
         self.share = share
         self._list_lock = threading.Lock()
         self._io_lock   = threading.Lock()
-        self._open_fids: dict = {}
+        self._fh_map: dict = {}
+        self._next_fh   = 1
 
         args = (host, user, password, domain, lmhash, nthash, kerberos, aes_key, kdc_host)
         self._list_conn = self._connect(*args)
@@ -1224,20 +1225,15 @@ class _ImpacketFUSE:
         p = fuse_path.replace('/', '\\')
         return p or '\\'
 
-    def getattr(self, path: str):
+    def getattr(self, path: str, fh=None):
         import errno
-        import fuse
         import stat as _stat
-
-        st = fuse.Stat()
-        st.st_uid = st.st_gid = 0
-        st.st_atime = st.st_mtime = st.st_ctime = 0
+        from fuse import FuseOSError
 
         if path == '/':
-            st.st_mode = _stat.S_IFDIR | 0o755
-            st.st_nlink = 2
-            st.st_size = 0
-            return st
+            return {'st_mode': _stat.S_IFDIR | 0o755, 'st_nlink': 2,
+                    'st_uid': 0, 'st_gid': 0, 'st_size': 0,
+                    'st_atime': 0, 'st_mtime': 0, 'st_ctime': 0}
 
         parent, name = path.rsplit('/', 1)
         smb_parent = self._smb_path(parent or '/')
@@ -1251,37 +1247,33 @@ class _ImpacketFUSE:
                         continue
                     if ename.lower() == name.lower():
                         if e.is_directory():
-                            st.st_mode = _stat.S_IFDIR | 0o755
-                            st.st_nlink = 2
-                            st.st_size = 0
-                        else:
-                            st.st_mode = _stat.S_IFREG | 0o444
-                            st.st_nlink = 1
-                            st.st_size = e.get_filesize()
-                        return st
+                            return {'st_mode': _stat.S_IFDIR | 0o755, 'st_nlink': 2,
+                                    'st_uid': 0, 'st_gid': 0, 'st_size': 0,
+                                    'st_atime': 0, 'st_mtime': 0, 'st_ctime': 0}
+                        return {'st_mode': _stat.S_IFREG | 0o444, 'st_nlink': 1,
+                                'st_uid': 0, 'st_gid': 0, 'st_size': e.get_filesize(),
+                                'st_atime': 0, 'st_mtime': 0, 'st_ctime': 0}
             except Exception:
                 pass
-        return -errno.ENOENT
+        raise FuseOSError(errno.ENOENT)
 
-    def readdir(self, path: str, offset):
-        import fuse
+    def readdir(self, path: str, fh):
         smb_path = self._smb_path(path)
         search = smb_path.rstrip('\\') + '\\*'
-        yield fuse.Direntry('.')
-        yield fuse.Direntry('..')
+        names = ['.', '..']
         with self._list_lock:
             try:
                 for e in self._list_conn.listPath(self.share, search):
                     name = e.get_longname()
                     if name not in ('.', '..'):
-                        d = fuse.Direntry(name)
-                        d.type = 4 if e.is_directory() else 8
-                        yield d
+                        names.append(name)
             except Exception as ex:
                 tprint(f"  [!] readdir {path}: {ex}")
+        return names
 
     def open(self, path: str, flags):
         import errno
+        from fuse import FuseOSError
         smb_path = self._smb_path(path)
         with self._io_lock:
             try:
@@ -1290,30 +1282,34 @@ class _ImpacketFUSE:
                     desiredAccess=0x80000000,
                     shareMode=0x00000007,
                 )
-                self._open_fids[path] = fid
-                return 0
+                fh = self._next_fh
+                self._next_fh += 1
+                self._fh_map[fh] = fid
+                return fh
             except Exception as ex:
                 tprint(f"  [!] open {path}: {ex}")
-                return -errno.EIO
+                raise FuseOSError(errno.EIO)
 
-    def read(self, path: str, size: int, offset: int):
+    def read(self, path: str, size: int, offset: int, fh):
         import errno
-        fid = self._open_fids.get(path)
+        from fuse import FuseOSError
+        fid = self._fh_map.get(fh)
         if fid is None:
-            return -errno.EBADF
+            raise FuseOSError(errno.EBADF)
         with self._io_lock:
             try:
-                return self._io_conn.readFile(self._tid, fid,
+                data = self._io_conn.readFile(self._tid, fid,
                                               offset=offset,
                                               bytesToRead=size,
                                               singleCall=False)
+                return data or b''
             except Exception as ex:
                 tprint(f"  [!] read {path}@{offset}: {ex}")
-                return -errno.EIO
+                raise FuseOSError(errno.EIO)
 
-    def release(self, path: str, flags):
+    def release(self, path: str, fh):
         with self._io_lock:
-            fid = self._open_fids.pop(path, None)
+            fid = self._fh_map.pop(fh, None)
             if fid is not None:
                 try:
                     self._io_conn.closeFile(self._tid, fid)
@@ -1335,10 +1331,9 @@ def mount_impacket_fuse(host: str, share: str, user: str, password: str,
                         kdc_host: str) -> tuple:
     """Mount an SMB share via impacket as a read-only FUSE filesystem."""
     try:
-        import fuse
-        fuse.fuse_python_api = (0, 2)
+        from fuse import FUSE, Operations, FuseOSError
     except ImportError:
-        die("python3-fuse not found — install: apt install python3-fuse  OR  pip install fusepy")
+        die("fusepy not found — install: pip install fusepy  OR  apt install python3-fuse")
 
     mnt = f"/mnt/smb_{share}"
     Path(mnt).mkdir(parents=True, exist_ok=True)
@@ -1348,17 +1343,17 @@ def mount_impacket_fuse(host: str, share: str, user: str, password: str,
     backend = _ImpacketFUSE(host, share, user, password, domain,
                              lmhash, nthash, kerberos, aes_key, kdc_host)
 
-    class _FW(fuse.Fuse):
-        def getattr(self, path):             return backend.getattr(path)
-        def readdir(self, path, offset):     return backend.readdir(path, offset)
-        def open(self, path, flags):         return backend.open(path, flags)
-        def read(self, path, size, offset):  return backend.read(path, size, offset)
-        def release(self, path, flags):      return backend.release(path, flags)
+    class _FW(Operations):
+        def getattr(self, path, fh=None):          return backend.getattr(path, fh)
+        def readdir(self, path, fh):               return backend.readdir(path, fh)
+        def open(self, path, flags):               return backend.open(path, flags)
+        def read(self, path, size, offset, fh):    return backend.read(path, size, offset, fh)
+        def release(self, path, fh):               return backend.release(path, fh)
 
-    server = _FW(version="%prog", usage="", dash_s_do='setsingle')
-    server.parse(['-o', 'ro,direct_io,nonempty', mnt], errex=1)
+    def _run():
+        FUSE(_FW(), mnt, nothreads=True, foreground=True, ro=True)
 
-    t = threading.Thread(target=server.main, daemon=True)
+    t = threading.Thread(target=_run, daemon=True)
     t.start()
 
     for _ in range(20):
