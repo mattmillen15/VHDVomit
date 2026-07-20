@@ -1621,6 +1621,8 @@ def run_file_mode(args):
 
 
 def main():
+    ensure_root()
+
     print(BANNER)
 
     parser = argparse.ArgumentParser(
@@ -1694,7 +1696,6 @@ Examples:
 
     args = parser.parse_args()
 
-    ensure_root()
     check_deps(smb_mode=bool(args.target))
 
     if args.target:

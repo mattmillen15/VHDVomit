@@ -935,9 +935,9 @@ def run_local_mode(args):
 
 
 def main():
-    print(BANNER)
-
     ensure_root()
+
+    print(BANNER)
 
     parser = argparse.ArgumentParser(
         description='Mount SMB shares or scan local paths for VHD/VHDX/VMDK backups and extract credentials',
