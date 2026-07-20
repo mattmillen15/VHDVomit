@@ -1,0 +1,4 @@
+impacket
+fusepy
+zstandard
+cryptography

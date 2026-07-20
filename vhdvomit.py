@@ -242,7 +242,7 @@ def mount_impacket_fuse(host, share, user, password, domain,
         import fuse
         fuse.fuse_python_api = (0, 2)
     except ImportError:
-        die("python3-fuse not found — install: apt install python3-fuse")
+        die("python3-fuse not found — install: apt install python3-fuse  OR  pip install fusepy")
 
     mnt = f"/mnt/smb_{share}"
     Path(mnt).mkdir(parents=True, exist_ok=True)
