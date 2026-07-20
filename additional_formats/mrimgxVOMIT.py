@@ -105,7 +105,8 @@ def die(msg, code=1):
 
 def ensure_root():
     if os.geteuid() != 0:
-        die("Must run as root (use sudo)")
+        print("[*] Root required — re-running with sudo...")
+        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
 
 
 def check_deps(smb_mode: bool = False):
