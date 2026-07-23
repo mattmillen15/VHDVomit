@@ -559,7 +559,7 @@ def mount_vhdx_image(vhdx_path, fuse_mode=False):
     vhdx_name = Path(vhdx_path).stem
     ext = Path(vhdx_path).suffix.lower()
 
-    fmt = {'vmdk': 'vmdk', '.vhd': 'vhd'}.get(ext, 'vhdx')
+    fmt = {'.vmdk': 'vmdk', '.vhd': 'vpc', '.vhdx': 'vhdx'}.get(ext, 'vhdx')
 
     print(f"[*] Processing: {Path(vhdx_path).name}")
 
@@ -937,23 +937,29 @@ def run_local_mode(args):
     local_paths = args.local_path
 
     valid_paths = []
+    direct_files = []
     for p in local_paths:
         path = Path(p)
         if not path.exists():
             print(f"[!] Path does not exist: {p}")
-        elif not path.is_dir():
-            print(f"[!] Not a directory: {p}")
-        else:
+        elif path.is_file() and path.suffix.lower() in ('.vhd', '.vhdx', '.vmdk'):
+            direct_files.append(str(path.resolve()))
+        elif path.is_dir():
             valid_paths.append(str(path.resolve()))
+        else:
+            print(f"[!] Not a directory or recognised disk image: {p}")
 
-    if not valid_paths:
-        die("No valid local paths to scan")
+    if not valid_paths and not direct_files:
+        die("No valid local paths or disk images to process")
 
-    print(f"[*] Local mode — scanning {len(valid_paths)} path(s):")
-    for p in valid_paths:
-        print(f"    {p}")
-
-    vhdx_files = find_vhdx_files(valid_paths, max_workers=args.workers)
+    vhdx_files = direct_files[:]
+    if valid_paths:
+        print(f"[*] Local mode — scanning {len(valid_paths)} path(s):")
+        for p in valid_paths:
+            print(f"    {p}")
+        vhdx_files += find_vhdx_files(valid_paths, max_workers=args.workers)
+    elif direct_files:
+        print(f"[*] Local mode — using {len(direct_files)} specified file(s):")
 
     if not vhdx_files:
         print("[!] No VHD/VHDX/VMDK files found")
