@@ -45,6 +45,12 @@ Examples:
   
   Specific path:
     vhdvomit.py -t 192.168.1.10 -u admin -p pass --path "D$/Backups/VMs"
+
+  Already-mounted share or local directory (scans for VHD/VHDX/VMDK):
+    sudo vhdvomit.py --local-path /mnt/backups/
+
+  Direct file (skips directory scan):
+    sudo vhdvomit.py --local-path /mnt/backups/dc01.vhd
 ```
 ___
 ## Pre-Reqs
