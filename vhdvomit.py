@@ -427,7 +427,7 @@ def scan_directory_for_vhdx(directory):
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
-                            if entry.name.lower().endswith(('.vhdx', '.vhd', '.vmdk')):
+                            if entry.name.lower().endswith(('.vhdx', '.avhdx', '.vhd', '.vmdk')):
                                 size = get_file_size_gb(entry.path)
                                 found.append(entry.path)
                                 tprint(f"    [+] FOUND: {entry.name} ({size})")
@@ -465,7 +465,7 @@ def find_vhdx_files(paths, max_workers=10):
                     if entry.is_dir(follow_symlinks=False):
                         subdirs.append(Path(entry.path))
                     elif entry.is_file(follow_symlinks=False):
-                        if entry.name.lower().endswith(('.vhd', '.vhdx', '.vmdk')):
+                        if entry.name.lower().endswith(('.vhd', '.vhdx', '.avhdx', '.vmdk')):
                             size = get_file_size_gb(entry.path)
                             early_hits.append(entry.path)
                             print(f"    [+] FOUND: {entry.name} ({size})")
@@ -559,7 +559,7 @@ def mount_vhdx_image(vhdx_path, fuse_mode=False):
     vhdx_name = Path(vhdx_path).stem
     ext = Path(vhdx_path).suffix.lower()
 
-    fmt = {'.vmdk': 'vmdk', '.vhd': 'vpc', '.vhdx': 'vhdx'}.get(ext, 'vhdx')
+    fmt = {'.vmdk': 'vmdk', '.vhd': 'vpc', '.vhdx': 'vhdx', '.avhdx': 'vhdx'}.get(ext, 'vhdx')
 
     print(f"[*] Processing: {Path(vhdx_path).name}")
 
@@ -942,7 +942,7 @@ def run_local_mode(args):
         path = Path(p)
         if not path.exists():
             print(f"[!] Path does not exist: {p}")
-        elif path.is_file() and path.suffix.lower() in ('.vhd', '.vhdx', '.vmdk'):
+        elif path.is_file() and path.suffix.lower() in ('.vhd', '.vhdx', '.avhdx', '.vmdk'):
             direct_files.append(str(path.resolve()))
         elif path.is_dir():
             valid_paths.append(str(path.resolve()))
