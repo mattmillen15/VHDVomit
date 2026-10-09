@@ -739,10 +739,15 @@ def _copy_hives(tmp_dir, *hive_paths):
     return copies
 
 
-def _dump_dc(hostname, ntds, system, security):
+def _dump_dc(hostname, ntds, system, security, sam=None):
     with tempfile.TemporaryDirectory(prefix="vhdvomit_hives_") as tmp:
-        ntds_c, sys_c, sec_c = _copy_hives(tmp, ntds, system, security)
-        args = ['-ntds', ntds_c, '-system', sys_c, 'LOCAL']
+        ntds_c, sys_c, sec_c, sam_c = _copy_hives(tmp, ntds, system, security, sam)
+        args = ['-ntds', ntds_c, '-system', sys_c]
+        if sec_c:
+            args.extend(['-security', sec_c])
+        if sam_c:
+            args.extend(['-sam', sam_c])
+        args.append('LOCAL')
         run_secretsdump(args, f"{hostname}_secretsdump.txt")
 
 
@@ -800,9 +805,11 @@ def extract_credentials(vhdx_path, fuse_mode=False):
 
             if ntds and system.exists():
                 print(f"[+] Domain Controller backup detected")
-                _dump_dc(hostname, ntds, system, security if security.exists() else None)
+                _dump_dc(hostname, ntds, system,
+                         security if security.exists() else None,
+                         sam if sam.exists() else None)
 
-            if sam.exists() and system.exists():
+            elif sam.exists() and system.exists():
                 print(f"[+] SAM database found")
                 _dump_sam(hostname, sam, system, security if security.exists() else None)
 
